@@ -1,0 +1,5 @@
+# 构建与打包产物
+build/
+dist/
+# 开发期探测实验（wayland-probe 等），不随发布
+experiments/

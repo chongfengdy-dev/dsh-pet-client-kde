@@ -1,0 +1,19 @@
+{
+  "name": "dsh-pet-state-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH agent 状态 → 宠物四色上报插件：处理中/等授权=orange，一轮回复完成=green，空闲=blue。零依赖纯观察者。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

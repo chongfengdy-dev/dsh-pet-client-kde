@@ -1,0 +1,12 @@
+# dsh-pet-state-plugin —— 作为 profile bundle 使用时的 loader entry。
+# 端口/URL/去抖参数按需在 profile 用户层 cordis.patch.yml 用 - id: pet-state 覆盖 config。
+
+- insert:
+    - id: pet-state
+      name: dsh-pet-state-plugin
+      config:
+        host: 127.0.0.1
+        port: 3081
+        path: /api/pet-state
+        greenHoldMs: 8000
+        timeoutMs: 800
