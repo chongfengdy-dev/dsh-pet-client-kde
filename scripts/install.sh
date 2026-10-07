@@ -39,10 +39,10 @@ mkdir -p "$APPS"
 cat > "$APPS/dsh-pet.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=DSH Pet
-Name[zh_CN]=DSH 桌面鲸鱼
+Name=DSH Tray
+Name[zh_CN]=DSH 托盘
 Comment=DeepSeek Harness floating whale (status indicator)
-Comment[zh_CN]=DeepSeek Harness 悬浮鲸鱼状态指示器
+Comment[zh_CN]=DeepSeek Harness 托盘状态指示器
 Exec=$BIN/dsh-pet-client
 Icon=dsh-pet
 Terminal=false

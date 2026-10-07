@@ -88,7 +88,7 @@ PetApp::PetApp(QObject *parent)
 void PetApp::run(bool enableAutostart)
 {
     if (enableAutostart) {
-        if (Autostart::install(kAppId, QStringLiteral("DSH Pet")))
+        if (Autostart::install(kAppId, QStringLiteral("DSH Tray")))
             qInfo("dsh-pet: 已注册开机自启");
     }
 

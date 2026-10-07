@@ -43,7 +43,7 @@ bool Autostart::install(const QString &appName, const QString &displayName, cons
     out << "[Desktop Entry]\n"
         << "Type=Application\n"
         << "Name=" << displayName << "\n"
-        << "Comment=DeepSeek Harness 桌面鲸鱼\n"
+        << "Comment=DeepSeek Harness 托盘\n"
         << "Exec=" << exe << "\n"
         << "Icon=dsh-pet\n"
         << "Terminal=false\n"
