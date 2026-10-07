@@ -132,7 +132,8 @@ void Tray::rebuildMenu()
 
     m_menu->addSeparator();
 
-    QAction *quit = m_menu->addAction(QStringLiteral("退出"));
+    // 语义澄清：这里只退托盘客户端，dsh 后端服务继续跑（停服务用上面那项）
+    QAction *quit = m_menu->addAction(QStringLiteral("退出客户端（保留服务）"));
     connect(quit, &QAction::triggered, this, [this] { emit quitRequested(); });
 
     m_tray->setContextMenu(m_menu);
