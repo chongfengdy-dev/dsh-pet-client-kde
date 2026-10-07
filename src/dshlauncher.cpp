@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -179,4 +180,55 @@ QString DshLauncher::modeSwitchCommand(const QString &mode)
         return {};
     const QString cmd = QStringLiteral("bash \"%1\" %2").arg(info.path, mode);
     return info.native ? cmd : QStringLiteral("sudo ") + cmd;
+}
+
+QStringList DshLauncher::serviceUnits()
+{
+    // 动态枚举而不是写死服务名：以后新增 dsh-xxx 服务会自动纳入。
+    // 托盘客户端自身若也注册成 dsh-* 单元，必须排除——停了它就没代码再拉起来了。
+    QProcess p;
+    p.start(QStringLiteral("systemctl"),
+            {QStringLiteral("--user"), QStringLiteral("list-unit-files"),
+             QStringLiteral("dsh-*.service"), QStringLiteral("--no-legend"),
+             QStringLiteral("--no-pager")});
+    if (!p.waitForFinished(4000))
+        return {};
+
+    QStringList units;
+    const QStringList lines = QString::fromUtf8(p.readAllStandardOutput())
+                                  .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    for (const QString &line : lines) {
+        const QString unit = line.split(QRegularExpression(QStringLiteral("\\s+")),
+                                        Qt::SkipEmptyParts)
+                                 .value(0);
+        if (!unit.endsWith(QLatin1String(".service")))
+            continue;
+        if (unit.contains(QLatin1String("pet"), Qt::CaseInsensitive))
+            continue;
+        units << unit;
+    }
+    units.removeDuplicates();
+    return units;
+}
+
+bool DshLauncher::servicesActive()
+{
+    const QStringList units = serviceUnits();
+    if (units.isEmpty())
+        return false;
+
+    QProcess p;
+    QStringList args{QStringLiteral("--user"), QStringLiteral("is-active")};
+    args << units;
+    p.start(QStringLiteral("systemctl"), args);
+    if (!p.waitForFinished(4000))
+        return false;
+
+    const QStringList states = QString::fromUtf8(p.readAllStandardOutput())
+                                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    for (const QString &s : states) {
+        if (s.trimmed() == QLatin1String("active"))
+            return true;
+    }
+    return false;
 }

@@ -36,6 +36,8 @@ public:
 signals:
     void activateRequested();                        ///< 左键单击托盘图标
     void modeSwitchRequested(const QString &mode);   ///< "full" / "clean"
+    void dshServicesStartRequested();                ///< 启动 dsh 后端全套服务
+    void dshServicesStopRequested();                 ///< 退出 dsh 后端全套服务
     void quitRequested();
 
 private:
@@ -48,6 +50,8 @@ private:
     QMenu *m_menu = nullptr;
     QAction *m_fullAction = nullptr;
     QAction *m_cleanAction = nullptr;
+    QAction *m_svcStartAction = nullptr;
+    QAction *m_svcStopAction = nullptr;
 
     QIcon m_icons[4];
     PetColor m_base = PetColor::Blue;

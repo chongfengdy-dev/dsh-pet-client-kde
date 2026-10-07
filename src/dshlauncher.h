@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 
 namespace DshLauncher {
 
@@ -24,5 +25,10 @@ bool openDsh(QString *howLaunched = nullptr);
 ModeScriptInfo findModeScript();
 /// 需要用户到终端执行的命令文本（含动态路径，不硬编码家目录）
 QString modeSwitchCommand(const QString &mode);
+
+/// dsh 后端服务单元：动态枚举用户级 dsh-*.service（排除托盘客户端自身）
+QStringList serviceUnits();
+/// 是否有任一 dsh 后端服务正在运行（决定菜单里哪一项可用）
+bool servicesActive();
 
 } // namespace DshLauncher

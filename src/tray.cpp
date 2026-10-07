@@ -1,4 +1,5 @@
 #include "tray.h"
+#include "dshlauncher.h"
 
 #include <QAction>
 #include <QFile>
@@ -100,6 +101,26 @@ void Tray::rebuildMenu()
     if (m_menu)
         m_menu->deleteLater();
     m_menu = new QMenu();
+
+    // 服务开关放最上面：打游戏前一键腾内存，是这里最常用的操作
+    m_svcStartAction = m_menu->addAction(QStringLiteral("启动 dsh 服务"));
+    connect(m_svcStartAction, &QAction::triggered, this,
+            [this] { emit dshServicesStartRequested(); });
+
+    m_svcStopAction = m_menu->addAction(QStringLiteral("退出 dsh 服务（全部）"));
+    connect(m_svcStopAction, &QAction::triggered, this,
+            [this] { emit dshServicesStopRequested(); });
+
+    // 每次展开菜单时按真实运行状态决定哪一项可用（开关语义）
+    connect(m_menu, &QMenu::aboutToShow, this, [this] {
+        const bool active = DshLauncher::servicesActive();
+        if (m_svcStartAction)
+            m_svcStartAction->setEnabled(!active);
+        if (m_svcStopAction)
+            m_svcStopAction->setEnabled(active);
+    });
+
+    m_menu->addSeparator();
 
     m_fullAction = m_menu->addAction(QStringLiteral("切换：完整模式（复制指令）"));
     connect(m_fullAction, &QAction::triggered, this,

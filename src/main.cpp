@@ -49,6 +49,7 @@ private:
     void onStateUpdated(PetColor color, qint64 doneAt);
     void onDshWindowState(bool exists, bool minimized, bool active);
     void onModeSwitch(const QString &mode);
+    void setDshServices(bool start);
     void onQuit();
 
     Tray m_tray;
@@ -63,6 +64,7 @@ private:
     qint64 m_doneAt = 0;
     bool m_acked = false;
     bool m_ackEdge = false;   // 对话页面刚从后台切回前台（green 回执的边沿判据）
+    bool m_stoppingServices = false;   // 主动停 dsh 服务期间：抑制"窗口没了→自动拉起"
     bool m_quitting = false;
 };
 
@@ -71,6 +73,10 @@ PetApp::PetApp(QObject *parent)
 {
     connect(&m_tray, &Tray::activateRequested, this, &PetApp::toggleDsh);
     connect(&m_tray, &Tray::modeSwitchRequested, this, &PetApp::onModeSwitch);
+    connect(&m_tray, &Tray::dshServicesStartRequested, this,
+            [this] { setDshServices(true); });
+    connect(&m_tray, &Tray::dshServicesStopRequested, this,
+            [this] { setDshServices(false); });
     connect(&m_tray, &Tray::quitRequested, this, &PetApp::onQuit);
 
     connect(&m_state, &PetState::updated, this, &PetApp::onStateUpdated);
@@ -155,6 +161,8 @@ void PetApp::toggleDsh()
 
 void PetApp::launchDsh()
 {
+    if (m_stoppingServices)
+        return;   // 是我们主动停的服务，别再自动把浏览器拉起来
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - m_launchTick < kLaunchCooldownMs)
         return;
@@ -204,6 +212,49 @@ void PetApp::onModeSwitch(const QString &mode)
         nullptr, QStringLiteral("DSH 模式切换"),
         QStringLiteral("已复制以下指令到剪贴板，请在终端运行（遇到提权提示输入密码）：\n\n%1")
             .arg(cmd));
+}
+
+void PetApp::setDshServices(bool start)
+{
+    const QStringList units = DshLauncher::serviceUnits();
+    if (units.isEmpty()) {
+        m_tray.showMessage(
+            QStringLiteral("DSH 服务"),
+            QStringLiteral("未找到 dsh-* 用户服务单元（systemctl --user 不可用？）"));
+        return;
+    }
+
+    if (!start)
+        m_stoppingServices = true;   // 停服务会让对话窗口消失，别触发自动拉起
+
+    auto *proc = new QProcess(this);
+    QStringList args{QStringLiteral("--user"),
+                     start ? QStringLiteral("start") : QStringLiteral("stop")};
+    args << units;
+    proc->setProgram(QStringLiteral("systemctl"));
+    proc->setArguments(args);
+
+    connect(proc, &QProcess::finished, this,
+            [this, proc, start, units](int code, QProcess::ExitStatus) {
+                const QString out =
+                    QString::fromUtf8(proc->readAllStandardOutput()
+                                      + proc->readAllStandardError()).trimmed();
+                m_tray.showMessage(
+                    QStringLiteral("DSH 服务"),
+                    code == 0
+                        ? QStringLiteral("%1：%2")
+                              .arg(start ? QStringLiteral("已启动") : QStringLiteral("已退出"),
+                                   units.join(QStringLiteral(" ")))
+                        : QStringLiteral("操作失败（退出码 %1）\n%2").arg(code).arg(out));
+                if (!start)
+                    QTimer::singleShot(2000, this, [this] { m_stoppingServices = false; });
+                proc->deleteLater();
+            });
+    proc->start();
+
+    m_tray.showMessage(QStringLiteral("DSH 服务"),
+                       start ? QStringLiteral("正在启动 dsh 全套服务…")
+                             : QStringLiteral("正在退出 dsh 全套服务…"));
 }
 
 void PetApp::onQuit()
