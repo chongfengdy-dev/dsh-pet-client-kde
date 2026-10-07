@@ -8,7 +8,7 @@
 # 原理: 创建/删除标记文件 ~/.dsh/.dsh-web-mode，然后重启 dsh-web 服务。
 #       服务 ExecStart 由 web-launch.sh 读取该标记决定是否加 --patch。
 #
-# ⚠️ 与 nim-client/dsh-mode.sh（WSL 版）的区别：
+# ⚠️ 与 Windows/WSL 侧 dsh-mode.sh 的区别（那份已随仓库拆分移除）：
 #   WSL 版跑的是 **系统级** 单元，必须 sudo；Linux 桌面侧 dsh-web 是
 #   **systemd user 单元**（~/.config/systemd/user/），无需 sudo。
 #   用错版本会得到 "Unit dsh-web.service not found"。
