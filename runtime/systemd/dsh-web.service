@@ -1,0 +1,15 @@
+[Unit]
+Description=DSH Web Server (port 3080, DSH Pet)
+Documentation=https://github.com/chongfengdy-dev/dsh-pet-client-kde
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# 走启动包装：里面做 PATH 自愈与图形环境自愈（dsh 拉起 konsole 等外部程序需要）
+ExecStart=/usr/bin/bash %h/@REPO@/runtime/web-launch.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

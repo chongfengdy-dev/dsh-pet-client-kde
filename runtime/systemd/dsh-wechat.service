@@ -1,0 +1,13 @@
+[Unit]
+Description=DSH WeChat Channel (optional; send service on 3082)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/env node %h/.npm-global/bin/dsh --profile wechat
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

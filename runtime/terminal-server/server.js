@@ -1,0 +1,788 @@
+#!/usr/bin/env node
+// DSH-Pet-Client 集成终端服务
+// 架构：express(静态页面) + ws(终端 IO 通道) + node-pty(bash 真 PTY)
+// 端口 3081，只绑定 127.0.0.1（WSL 内部回环；Windows 客户端经 WSL2 localhost
+// 转发访问，与 3080 dsh-web 同一原理）。
+// 安全说明：自用版仅绑回环地址；如需对外暴露必须加 token 校验（见 TODO）。
+'use strict';
+
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const http = require('http');
+const express = require('express');
+const { WebSocketServer } = require('ws');
+const pty = require('node-pty');
+
+const PORT = 3081;
+const HOST = '127.0.0.1';
+
+const app = express();
+// no-store：终端页面每次重开都取最新版（WebView2 会缓存静态资源，
+// 之前改完页面侧仍显示旧版很可能就是缓存）
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  },
+}));
+// xterm.js 前端库（npm 包本地托管，离线可用）
+app.use('/vendor/xterm', express.static(path.join(__dirname, 'node_modules/@xterm/xterm/lib')));
+app.use('/vendor/xterm/css', express.static(path.join(__dirname, 'node_modules/@xterm/xterm/css')));
+app.use('/vendor/fit', express.static(path.join(__dirname, 'node_modules/@xterm/addon-fit/lib')));
+
+// ---------- DeepSeek 余额代理（Token HUD 用） ----------
+// 读 ~/.dsh/.credentials.yaml 的 DEEPSEEK_API_KEY，调 /user/balance；
+// 结果缓存 2 分钟（DeepSeek 该接口有频率限制）。仅绑 127.0.0.1，自用安全。
+const https = require('https');
+
+function readDeepSeekKey() {
+  try {
+    const yaml = fs.readFileSync(path.join(os.homedir(), '.dsh/.credentials.yaml'), 'utf8');
+    // ⚠️ key 在 refs: 嵌套下带缩进（2026-08-21 bug：余额一直不显示，根因即此）
+    const m = yaml.match(/^\s*DEEPSEEK_API_KEY:\s*(.+)$/m);
+    return m ? m[1].trim() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+let balanceCache = { at: 0, data: null };
+// CORS：dsh web 前端（3080）跨域 fetch 本接口
+app.use('/api', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+app.use(express.json({ limit: '20mb' }));   // 20MB：宠物状态小请求 + 图片 base64 上传
+
+// ---------- 终端图片背景（上传 + 静态托管） ----------
+// 插件设置面板选图 → POST base64 → 存 backgrounds/ → termHost 背景引用
+const BG_DIR = path.join(__dirname, 'backgrounds');
+fs.mkdirSync(BG_DIR, { recursive: true });
+app.use('/backgrounds', express.static(BG_DIR, {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  },
+}));
+app.post('/api/background', (req, res) => {
+  const { data, ext } = req.body || {};
+  if (!data || !ext) return res.status(400).json({ error: 'missing data/ext' });
+  const allowed = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
+  if (!allowed.includes(String(ext).toLowerCase())) {
+    return res.status(400).json({ error: 'unsupported type' });
+  }
+  const buf = Buffer.from(String(data), 'base64');
+  if (buf.length === 0 || buf.length > 15 * 1024 * 1024) {
+    return res.status(400).json({ error: 'invalid or too large' });
+  }
+  const file = 'bg.' + String(ext).toLowerCase();
+  fs.writeFileSync(path.join(BG_DIR, file), buf);
+  console.log(`[term] background updated: ${file} (${buf.length} bytes)`);
+  res.json({ url: '/backgrounds/' + file });
+});
+
+// ---------- 宠物状态（dsh web 插件 → 客户端 Nim） ----------
+// pet: 'blue'（终端收起，默认）| 'black'（终端打开）| 'orange'（提问/授权，心跳闪烁）
+//     | 'green'（回复完成，绿↔基态心跳闪烁；2026-08-21 用户需求：提问后 dsh 干完活绿闪提示）
+// 状态同时写本地文件（客户端 Nim 读文件，避免主循环 HTTP 网络调用——
+// 实测 net 模块 send/recv 在 Windows 触发 0xc0000005 访问冲突崩溃）
+// 路径动态化（2026-08-16 定稿）：写 Windows 用户目录根 pet-state.json，
+// 客户端 Nim 用 %USERPROFILE% 读同一位置——不再硬编码用户名/路径，换机可部署
+// green 的终止协议（2026-08-21）：Nim 检测到主窗口被提到最前（GetForegroundWindow）
+// → 写 %USERPROFILE%\pet-ack.json {doneAt} 回执；server 见 ack.doneAt >= green.doneAt
+// → 转回 blue（用户已看到回复）。ack 文件由 Nim 只写、server 只读。
+let petState = { pet: 'blue' };
+const GREEN_DONE_WINDOW_MS = 10 * 60 * 1000;  // 仅"最近 10 分钟内完成"的轮次发绿（防历史老轮次误报）
+// 绿色保持到"用户看到"（v2.2 与旧版同语义）：停靠由 Nim 壳检测 PWA 窗口置前 →
+// 写 %USERPROFILE%\pet-ack.json → 本监听见 ack.doneAt >= green.doneAt 转 blue。
+// 页面 focus 上报 /api/pet-ack 仍是快速路径（完整模式）。
+let lastAckMtime = 0;
+function checkPetAck() {
+  try {
+    const mt = fs.statSync(PET_ACK_FILE).mtimeMs;
+    if (mt !== lastAckMtime) {
+      lastAckMtime = mt;
+      if (petState.pet === 'green' && readPetAck() >= (petState.doneAt || 0)) {
+        petState = { pet: 'blue' };
+        writePetStateFile();
+      }
+    }
+  } catch (e) { /* 无 ack 文件则忽略 */ }
+}
+setInterval(checkPetAck, 1000);
+function winUserHome() {
+  // WSL 里解析 Windows 用户目录：/mnt/c/Users/<用户名>/（只取目录、排除系统内置与隐藏）
+  try {
+    const users = '/mnt/c/Users';
+    const entries = fs.readdirSync(users, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.') &&
+        !['Public', 'Default', 'Default User', 'All Users'].includes(d.name))
+      .map((d) => d.name);
+    return entries.length > 0 ? '/mnt/c/Users/' + entries[0] + '/' : null;
+  } catch (e) {
+    return null;
+  }
+}
+const PET_STATE_FILE = (winUserHome() || '/mnt/c/Users/') + 'pet-state.json';
+const PET_ACK_FILE = (winUserHome() || '/mnt/c/Users/') + 'pet-ack.json';
+function readPetAck() {
+  try { return JSON.parse(fs.readFileSync(PET_ACK_FILE, 'utf8')).doneAt || 0; }
+  catch (e) { return 0; }
+}
+function writePetStateFile() {
+  try {
+    fs.writeFileSync(PET_STATE_FILE, JSON.stringify(petState), 'utf8');
+  } catch (e) {
+    console.log('[term] pet-state file write failed:', e.message);
+  }
+}
+// ---------- 终端状态持久化（设置/几何存服务端文件，跨重启保留） ----------
+// 背景：WebView2 缓存目录（webui 随机/固定问题）不可靠，2026-08-16 定稿——
+// 设置与面板几何存 WSL 服务端文件，插件启动读、改动写，彻底持久
+const TERM_STATE_FILE = path.join(__dirname, 'term-state.json');
+app.get('/api/term-state', (req, res) => {
+  try {
+    const data = fs.readFileSync(TERM_STATE_FILE, 'utf8');
+    res.json(JSON.parse(data));
+  } catch (e) {
+    res.json(null);   // 首次/异常 → 默认
+  }
+});
+app.post('/api/term-state', (req, res) => {
+  try {
+    fs.writeFileSync(TERM_STATE_FILE, JSON.stringify(req.body || {}), 'utf8');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.get('/api/pet-state', (req, res) => res.json(petState));
+app.post('/api/pet-state', (req, res) => {
+  const pet = req.body && req.body.pet;
+  if (pet !== 'blue' && pet !== 'black' && pet !== 'orange' && pet !== 'green') {
+    return res.status(400).json({ error: 'pet must be blue|black|orange|green' });
+  }
+  petState = { pet, doneAt: pet === 'green' ? (req.body.doneAt || Date.now()) : undefined };
+  writePetStateFile();
+  res.json(petState);
+});
+// v2.2 浏览器化：页面聚焦 = 用户已看到回复 → green 转 blue 停绿闪
+// （原 Nim WebView 版：窗口置前写 pet-ack.json；浏览器方案由 term-panels
+// 页面在 visibilitychange/focus 时 POST 本端点，语义等价"用户看到回复"）
+app.post('/api/pet-ack', (req, res) => {
+  if (petState.pet === 'green') {
+    petState = { pet: 'blue' };
+    writePetStateFile();
+  }
+  res.json({ ok: true });
+});
+// ---------- 会话删除 / 恢复（已归档会话管理，2026-08-27 用户需求） ----------
+// dsh 核心无删除/取消归档 API：
+//  - 删除：删文件 ~/.dsh/sessions/<工作区>/session-<uuid>/，fs.watch 自动刷新列表
+//  - 恢复：从 ~/.dsh/storages/workspace.json 移除 archivedSessionIds 标记 + 重启 dsh web
+//    （host 内存态不同步，必须重启让 host 重载；web 有 Restart=always 自动拉起）
+// 安全：sessionId 带 "session-" 前缀；标准 uuid 或自定义（微信 session-wechat-xxx），
+// 仅允许安全字符（防路径穿越），路径限定 sessions 根内。
+const SESSIONS_ROOT = path.join(os.homedir(), '.dsh', 'sessions');
+const WORKSPACE_STATE_FILE = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
+// 删除挂起清单：记录"目录已删、但归档墓碑还没结算"的会话。
+// 前端读它做即时过滤；dsh-archive-sync 在 dsh 下次启动时结算并清空。
+const PENDING_DELETES_FILE = path.join(os.homedir(), '.dsh', 'storages', 'dsh-pending-deletes.json');
+// 2026-09-28：会话目录历史上有两种命名 —— 旧式 `session-<id>` 与新式纯 `<uuid>`。
+// 原正则写死 `^session-` 前缀，把归档列表里的纯 UUID 判为非法（返回 400）→ 删除/恢复全部失败。
+const SESSION_ID_RE = /^(session-)?[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+function normalizeSessionId(sessionId) {
+  if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) return null;
+  return sessionId;
+}
+function readPendingDeletes() {
+  try {
+    const j = JSON.parse(fs.readFileSync(PENDING_DELETES_FILE, 'utf8'));
+    return Array.isArray(j && j.ids) ? j.ids.filter((x) => typeof x === 'string') : [];
+  } catch (e) { return []; }
+}
+function addPendingDelete(sessionId) {
+  const ids = readPendingDeletes();
+  if (ids.includes(sessionId)) return;
+  const tmp = PENDING_DELETES_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({ ids: [...ids, sessionId] }, null, 2), 'utf8');
+  fs.renameSync(tmp, PENDING_DELETES_FILE);
+}
+function findSessionDir(fullId) {
+  let entries = [];
+  try { entries = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true }); } catch (e) { return null; }
+  // 2026-09-28：兼容两种历史命名（旧式 session-<id> / 新式纯 <uuid>），
+  // 传进来的 id 无论带不带前缀，都能命中磁盘上的真实目录。
+  const names = fullId.startsWith('session-')
+    ? [fullId, fullId.slice('session-'.length)]
+    : [fullId, 'session-' + fullId];
+  for (const ws of entries) {
+    if (!ws.isDirectory()) continue;
+    for (const name of names) {
+      const target = path.join(SESSIONS_ROOT, ws.name, name);
+      try {
+        if (fs.statSync(target).isDirectory()) return target;
+      } catch (e) { /* 继续找 */ }
+    }
+  }
+  return null;
+}
+// 前端（已归档面板）查询：这些会话已删除，刷新页面后也不要再显示
+app.get('/api/session-pending-deletes', (req, res) => {
+  res.json({ ids: readPendingDeletes() });
+});
+app.post('/api/session-delete', (req, res) => {
+  const fullId = normalizeSessionId(req.body && req.body.sessionId);
+  if (!fullId) return res.status(400).json({ error: 'invalid session id' });
+  const target = findSessionDir(fullId);
+  if (!target) {
+    // 2026-09-28：目录已不存在（历史删除残留的孤儿归档项）→ 视为「已删除」幂等成功：
+    // 从归档集合里摘掉它并记入 pending，而不是回 404 让前端报「删除失败」。
+    try {
+      const raw = fs.readFileSync(WORKSPACE_STATE_FILE, 'utf8');
+      const state = JSON.parse(raw);
+      let changed = false;
+      const arr = state.global && state.global.archivedSessionIds;
+      if (Array.isArray(arr) && arr.includes(fullId)) {
+        state.global.archivedSessionIds = arr.filter((x) => x !== fullId);
+        changed = true;
+      }
+      if (changed) {
+        const tmp = WORKSPACE_STATE_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+        fs.renameSync(tmp, WORKSPACE_STATE_FILE);
+      }
+    } catch (e) { console.log('[session-delete] orphan cleanup failed:', e.message); }
+    try { addPendingDelete(fullId); } catch (e) {}
+    console.log('[session-delete] orphan purged (dir missing)', fullId);
+    return res.json({ ok: true, note: 'already gone' });
+  }
+  const rootReal = path.resolve(SESSIONS_ROOT);
+  const targetReal = path.resolve(target);
+  if (!targetReal.startsWith(rootReal + path.sep)) {
+    return res.status(403).json({ error: 'path outside sessions root' });
+  }
+  // 2026-09-11 方案（主定）：
+  //   1) 立刻隐藏：ID 写进归档集合 archivedSessionIds（durable 显示过滤，工作区立即不显示）
+  //   2) 记录删除挂起清单（前端过滤 + 重启结算的依据）
+  //   3) 真实删除：目录/投影缓存立即删；归档集合里那条"墓碑"由 dsh-archive-sync
+  //      在 dsh 下次启动时结算掉（运行中清理会让会话又冒回工作区，见插件注释）
+  try {
+    const raw = fs.readFileSync(WORKSPACE_STATE_FILE, 'utf8');
+    const state = JSON.parse(raw);
+    let changed = false;
+    const arr = state.global && state.global.archivedSessionIds;
+    if (Array.isArray(arr) && !arr.includes(fullId)) {
+      state.global.archivedSessionIds = [...arr, fullId];
+      changed = true;
+      console.log('[session-delete] hidden via archive-set', fullId);
+    }
+    // 兜底：顺带把 sessionIds 里的引用去掉（dsh 可能稍后按索引写回，无害）
+    const workspaces = (state.tables && state.tables.workspaces) || {};
+    for (const wsId of Object.keys(workspaces)) {
+      const ws = workspaces[wsId];
+      if (ws && Array.isArray(ws.sessionIds) && ws.sessionIds.includes(fullId)) {
+        ws.sessionIds = ws.sessionIds.filter((id) => id !== fullId);
+        changed = true;
+        console.log('[session-delete] workspace sessionIds cleaned', wsId, fullId);
+      }
+    }
+    if (changed) {
+      const tmp = WORKSPACE_STATE_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+      fs.renameSync(tmp, WORKSPACE_STATE_FILE);
+    }
+  } catch (e) { console.log('[session-delete] state cleanup failed:', e.message); }
+
+  try {
+    addPendingDelete(fullId);
+    console.log('[session-delete] pending-delete recorded', fullId);
+  } catch (e) { console.log('[session-delete] pending-delete record failed:', e.message); }
+
+  fs.rmSync(targetReal, { recursive: true, force: true });
+  console.log('[session-delete] removed', targetReal);
+
+  // 投影缓存也清（否则列表可能从缓存重建）
+  try {
+    const pcFile = path.join(os.homedir(), '.dsh', 'storages', 'session_projcache', 'sessions', fullId + '.json');
+    if (fs.existsSync(pcFile)) {
+      fs.rmSync(pcFile, { force: true });
+      console.log('[session-delete] projcache removed', fullId);
+    }
+  } catch (e) { console.log('[session-delete] projcache cleanup failed:', e.message); }
+
+  res.json({ ok: true });
+  // 不重启 dsh web：隐藏由归档集合（插件同步）+ 下次重启时插件结算完成。
+});
+app.post('/api/session-unarchive', (req, res) => {
+  const fullId = normalizeSessionId(req.body && req.body.sessionId);
+  if (!fullId) return res.status(400).json({ error: 'invalid session id' });
+  try {
+    const raw = fs.readFileSync(WORKSPACE_STATE_FILE, 'utf8');
+    const state = JSON.parse(raw);
+    const arr = state.global && state.global.archivedSessionIds;
+    if (!Array.isArray(arr)) return res.status(404).json({ error: 'no archive set' });
+    if (!arr.includes(fullId)) return res.status(404).json({ error: 'session not archived' });
+    state.global.archivedSessionIds = arr.filter((id) => id !== fullId);
+    // 原子写：临时文件 + rename（避免半写）
+    const tmp = WORKSPACE_STATE_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tmp, WORKSPACE_STATE_FILE);
+    console.log('[session-unarchive] restored', fullId);
+    // 2026-09-10：不再重启 dsh web。
+    // 原实现靠 SIGTERM 重启让 host 重读 workspace.json（每次恢复要等 3-5 秒 + 手动刷新）。
+    // 现在由 dsh-archive-sync 插件在 dsh 进程内轮询该文件并同步内存（setState），
+    // 恢复瞬间生效、零重启；插件缺失时最坏回落到"重启一次"的老行为。
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// ---------- 横杠大纲历史持久化（服务端文件，跨重启保留） ----------
+// 2026-08-17 定稿：横杠记录要"关机也能找回来"，走服务端文件（localStorage 在
+// WebView2 缓存目录下不可靠）。按会话 ID 存 [{text}] 列表；插件启动读、来一条写一条。
+const OUTLINE_HISTORY_FILE = path.join(__dirname, 'outline-history.json');
+app.get('/api/outline-history', (req, res) => {
+  const sid = req.query.sessionId || '';
+  if (!sid) return res.status(400).json({ error: 'sessionId required' });
+  try {
+    const data = JSON.parse(fs.readFileSync(OUTLINE_HISTORY_FILE, 'utf8'));
+    res.json({ list: Array.isArray(data[sid]) ? data[sid] : [] });
+  } catch (e) {
+    res.json({ list: [] });   // 首次/异常 → 空
+  }
+});
+app.post('/api/outline-history', (req, res) => {
+  try {
+    const sid = req.body.sessionId;
+    const list = req.body.list;
+    if (!sid || !Array.isArray(list)) return res.status(400).json({ error: 'sessionId and list array required' });
+    let data = {};
+    try { data = JSON.parse(fs.readFileSync(OUTLINE_HISTORY_FILE, 'utf8')); } catch (e) {}
+    data[sid] = list;
+    fs.writeFileSync(OUTLINE_HISTORY_FILE, JSON.stringify(data), 'utf8');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// 提问检测（权威源）：会话记录 approval/asked vs decided，
+// 有未决提问 → orange；回复完成（turn 配对，用户提问触发的轮次）→ green；否则 blue
+// （黑/蓝由客户端本地按窗口状态决定）。
+// 前端事件通道（subscribeEnvelopes）是诊断用途收不到业务事件，改后端检测。
+// 事件驱动（2026-08-16 用户要求省资源）：fs.watch 监听会话目录，有写入才检测
+// （防抖合并），静默期零检测零消耗；不再固定 2 秒轮询解压。
+// 每次检测都写文件（不能只写"变化时"——服务重启内存重置 blue 后，旧文件
+// orange 永不被覆盖，Nim 会一直读到橙色闪烁；2026-08-16 实测踩坑）
+// green 的确认（2026-08-21）：Nim 窗口置前写 pet-ack.json → 本检测见
+// ack.doneAt >= doneAt 判定为已看 → 转 blue（不覆盖 ack 文件，Nim 每次置前都重写）
+const { execFile } = require('child_process');
+let askRunning = false;
+let askPending = false;
+function runAskDetection() {
+  if (askRunning) { askPending = true; return; }   // 限流：进行中则排队一次
+  askRunning = true;
+  execFile('python3', [path.join(__dirname, 'ask-pending.py')], { timeout: 8000 }, (err, stdout) => {
+    askRunning = false;
+    if (!err) {
+      try {
+        const r = JSON.parse(stdout);
+        if (r.asking) {
+          petState = { pet: 'orange' };
+        } else if (r.done && !(readPetAck() >= (r.doneAt || 0)) &&
+                   (!r.doneAt || Date.now() - r.doneAt <= GREEN_DONE_WINDOW_MS)) {
+          // 绿色仅对"最近完成的轮次"发提醒；保持到 Nim 检测窗口置前写 ack 或页面 focus ack
+          petState = { pet: 'green', doneAt: r.doneAt || Date.now() };
+        } else {
+          petState = { pet: 'blue' };
+        }
+        writePetStateFile();
+      } catch (e) { /* 解析失败保持现状 */ }
+    }
+    if (askPending) { askPending = false; runAskDetection(); }
+  });
+}
+// 会话变更检测（2026-09-06 修复）：fs.watch recursive 在 Linux(WSL) 不被支持
+// （只监控顶层目录），深层 session 文件写入不触发 → 绿闪检测只剩重启时一次。
+// 改为轻量 mtime 轮询（2s stat 最新会话文件，mtime 变化才跑检测，静默期零开销）。
+let lastSessMtime = 0;
+function latestSessionMtime() {
+  try {
+    const root = path.join(os.homedir(), '.dsh', 'sessions');
+    let best = 0;
+    for (const scope of fs.readdirSync(root)) {
+      const sp = path.join(root, scope);
+      if (!fs.statSync(sp).isDirectory()) continue;
+      for (const sid of fs.readdirSync(sp)) {
+        // 会话日志改名历史：session.jsonl.zstd → session.v3.jsonl.zstd（0.1.5）→ session.v4.jsonl.zstd（0.1.7）。
+        // 2026-09-28：dsh 0.1.7 起新会话写 v4（v4 是完整文件，非增量），旧会话仍只有 v3，故按新→旧顺序探测。
+        for (const name of ['session.v4.jsonl.zstd', 'session.v3.jsonl.zstd', 'session.jsonl.zstd']) {
+          const f = path.join(sp, sid, name);
+          try { const mt = fs.statSync(f).mtimeMs; if (mt > best) best = mt; } catch (e) {}
+        }
+      }
+    }
+    return best;
+  } catch (e) { return 0; }
+}
+setInterval(() => {
+  const mt = latestSessionMtime();
+  if (mt !== lastSessMtime) { lastSessMtime = mt; runAskDetection(); }
+}, 2000);
+runAskDetection();                                    // 启动立即检测一次（同步文件）
+
+// ---------- 今日词元统计（聚合 dsh 会话记录，前端事件流不可靠，改后端算） ----------
+// 异步聚合（execFileSync 会阻塞事件循环 20+ 秒，终端 WS 卡顿，不可用）
+let todayUsageCache = { at: 0, data: null };
+let todayUsageBusy = false;
+function refreshTodayUsage() {
+  if (todayUsageBusy) return;
+  todayUsageBusy = true;
+  execFile('python3', [path.join(__dirname, 'today-usage.py')], { timeout: 120000 }, (err, stdout) => {
+    todayUsageBusy = false;
+    if (err) return;
+    try {
+      todayUsageCache = { at: Date.now(), data: JSON.parse(stdout) };
+    } catch (e) { /* 解析失败保持旧缓存 */ }
+  });
+}
+refreshTodayUsage();                          // 启动立即聚合一次（HUB 不显示 aggregating）
+setInterval(refreshTodayUsage, 60000);   // 后台 60 秒刷新一次
+app.get('/api/today-usage', (req, res) => {
+  if (todayUsageCache.data) {
+    res.json(todayUsageCache.data);
+  } else {
+    res.json({ input: 0, output: 0, cacheRead: 0, note: 'aggregating' });
+  }
+  refreshTodayUsage();   // 异步触发聚合（下次请求拿到新值）
+});
+app.get('/api/balance', (req, res) => {
+  if (balanceCache.data && Date.now() - balanceCache.at < 30000) {  // 余额 30s 缓存（2026-08-21 定）
+    return res.json(balanceCache.data);
+  }
+  const key = readDeepSeekKey();
+  if (!key) return res.status(500).json({ error: 'no DEEPSEEK_API_KEY' });
+  const req2 = https.request({
+    host: 'api.deepseek.com',
+    path: '/user/balance',
+    method: 'GET',
+    headers: { Authorization: 'Bearer ' + key },
+    timeout: 8000,
+  }, (resp) => {
+    let body = '';
+    resp.on('data', (c) => { body += c; });
+    resp.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        balanceCache = { at: Date.now(), data };
+        res.json(data);
+      } catch (e) {
+        res.status(502).json({ error: 'bad upstream response' });
+      }
+    });
+  });
+  req2.on('error', () => res.status(502).json({ error: 'upstream error' }));
+  req2.on('timeout', () => { req2.destroy(); });
+  req2.end();
+});
+
+// ---------- dsh 版本检测（2026-08-19 用户要求：有新版时前端提示） ----------
+// ⚠️ DEMO_MODE = 演示模式（演示提示条/更新流程）：模拟有新版 rc.8、点更新跳过真实安装。
+//    恢复真实逻辑：DEMO_MODE 改 false，/api/dsh-version 走 30min 缓存 npm 查询，/api/dsh-update 走真实 npm install。
+const DEMO_MODE = false;  // 已恢复真实逻辑（2026-08-19 验收演示后关闭）
+let dshVerCache = { at: 0, data: null };
+// 动态取用户 home，不硬编码用户名（2026-08-25 用户要求：发布代码不含个人电脑名）
+const DSH_HOME = os.homedir();
+const DSH_LOCAL_PKG = DSH_HOME + '/.npm-global/lib/node_modules/@deepseek-ai/dsh/package.json';
+// ⚠️ 用 fs 读版本而非 require()：require 有模块缓存，npm install 更新后进程内仍读到旧版本
+// （2026-08-20 bug：点更新后磁盘已是 0.1.1-rc.1 但页面一直显示 0.1.0-rc.7，根因即此）
+function readLocalDshVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(DSH_LOCAL_PKG, 'utf8')).version || null;
+  } catch (e) {}
+  try {
+    return require('child_process').execSync(DSH_HOME + '/.npm-global/bin/dsh --version', { timeout: 5000 }).toString().trim() || null;
+  } catch (e2) { return null; }
+}
+function refreshDshVersion() {
+  const local = readLocalDshVersion();
+  const finish = (latest) => {
+    dshVerCache = { at: Date.now(), data: { local, latest, hasUpdate: !!(local && latest && local !== latest) } };
+  };
+  // registry 动态读取（~/.npmrc），不写死 npmjs.org —— 国内直连常超时导致 latest 恒为 null
+  let reg = 'https://registry.npmjs.org';
+  try {
+    const m = fs.readFileSync(path.join(os.homedir(), '.npmrc'), 'utf8').match(/^\s*registry\s*=\s*(\S+)/m);
+    if (m) reg = m[1].replace(/\/+$/, '');
+  } catch (e) {}
+  let u;
+  try {
+    u = new URL(reg + '/@deepseek-ai/dsh/latest');
+    if (u.protocol !== 'https:') u = new URL('https://registry.npmjs.org/@deepseek-ai/dsh/latest');
+  } catch (e) { return finish(null); }
+  const req = https.request({ host: u.hostname, path: u.pathname, method: 'GET', timeout: 8000 }, (resp) => {
+    let body = '';
+    resp.on('data', (c) => { body += c; });
+    resp.on('end', () => {
+      try { const d = JSON.parse(body); finish(d.version || null); } catch (e) { finish(null); }
+    });
+  });
+  req.on('error', () => finish(null));
+  req.on('timeout', () => req.destroy());
+  req.end();
+}
+app.get('/api/dsh-version', (req, res) => {
+  if (DEMO_MODE) return res.json({ local: '0.1.0-rc.7', latest: '0.1.0-rc.9-demo', hasUpdate: true });
+  if (!dshVerCache.data || Date.now() - dshVerCache.at > 30 * 60 * 1000) refreshDshVersion();
+  res.json(dshVerCache.data || { local: null, latest: null, hasUpdate: false, note: 'checking' });
+});
+
+// ---------- dsh 一键更新（2026-08-19 用户要求：提示条点「更新」即执行） ----------
+app.post('/api/dsh-update', (req, res) => {
+  // 演示模式：跳过真实安装，直接返回成功（2026-08-19 要求：演示流程不真更新）
+  if (DEMO_MODE) return res.json({ ok: true, local: '0.1.0-rc.9-demo', restarted: false });
+  const { execFile } = require('child_process');
+  // npm 动态定位：优先取 node 同目录（官方分发包），否则交给 PATH。
+  // 不写死 /usr/bin/npm —— 不同发行版/安装方式的 npm 位置不同（deepin 在 /usr/local/bin）。
+  const NPM_BIN = (() => {
+    const beside = path.join(path.dirname(process.execPath), 'npm');
+    return fs.existsSync(beside) ? beside : 'npm';
+  })();
+  execFile(NPM_BIN, ['install', '-g', '@deepseek-ai/dsh', '--cache', '/tmp/npm-cache-dsh-update'], { timeout: 180000 }, (err, stdout, stderr) => {
+    if (err) return res.status(500).json({ ok: false, error: String(stderr || stdout || err).slice(0, 400) });
+    dshVerCache = { at: 0, data: null };  // 清缓存，下次重新读新版本
+    execFile('sudo', ['-n', 'systemctl', 'restart', 'dsh-web'], { timeout: 30000 }, (err2) => {
+      const local = readLocalDshVersion();  // fs 读取，绕过 require 缓存
+      res.json({ ok: true, local, restarted: !err2 });
+    });
+  });
+});
+
+// ---------- 平台用量代理（Token HUB 六项数据源：输入命中/未命中/输出/今日消耗） ----------
+// 2026-08-17 定稿：余额走官方 API（/api/balance），其余走 DeepSeek 开放平台
+// 私有用量接口（platform.deepseek.com/api/v0/usage/amount|cost，需网页登录 token）。
+// 干跑实测：必须带浏览器特征头（UA/Origin/Referer），否则平台 WAF 拦截（Request Blocked）。
+// 返回结构：amount 的 biz_data 是对象 {total, days}；cost 的 biz_data 是数组
+// [{total, days, currency}]（取 [0]）。days 为当月逐日明细，date 形如 "2026-08-17"，
+// 每格 data 按模型给 usage 数组，type 枚举：
+//   PROMPT_CACHE_HIT_TOKEN=输入(命中) / PROMPT_CACHE_MISS_TOKEN=输入(未命中)
+//   / RESPONSE_TOKEN=输出 / REQUEST=请求次数；amount 是 token 数，cost 是金额（元，字符串）。
+const PLATFORM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const PLATFORM_ORIGIN = 'https://platform.deepseek.com';
+
+function readPlatformToken() {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(__dirname, 'platform-token.json'), 'utf8'));
+    return j.userToken || null;
+  } catch (e) { return null; }
+}
+
+// 自动刷新平台 token（2026-08-25 用户要求：不再手动 F12 找 token）。
+// 读 CentBrowser localStorage（platform.deepseek.com userToken，明文 LevelDB），
+// 一直登录着开放平台 → token 随时可取。由 fetch-platform-token.py 完成。
+let platformTokenRefreshing = false;
+function autoRefreshPlatformToken() {
+  if (platformTokenRefreshing) return Promise.resolve(false);
+  platformTokenRefreshing = true;
+  return new Promise((resolve) => {
+    execFile('python3', [path.join(__dirname, 'fetch-platform-token.py'), '--write'],
+      { timeout: 15000, env: { ...process.env } },
+      (err, stdout) => {
+        platformTokenRefreshing = false;
+        if (!err) {
+          console.log('[term] platform token auto-refreshed:', String(stdout).trim());
+          resolve(true);
+        } else {
+          console.log('[term] platform token refresh failed:', String(err.message || err).slice(0, 200));
+          resolve(false);
+        }
+      });
+  });
+}
+
+function platformGet(apiPath) {
+  const token = readPlatformToken();
+  if (!token) return Promise.reject(new Error('no platform token'));
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      host: 'platform.deepseek.com',
+      path: apiPath,
+      method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        Accept: 'application/json',
+        'User-Agent': PLATFORM_UA,
+        Origin: PLATFORM_ORIGIN,
+        Referer: PLATFORM_ORIGIN + '/',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+      },
+      timeout: 10000,
+    }, (resp) => {
+      let body = '';
+      resp.on('data', (c) => { body += c; });
+      resp.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          // 平台对无效 token 返回 HTTP 200 + {"code":40003,"msg":"Authorization Failed"}
+          // （2026-08-25 实测；非 401/403）
+          const authFail = resp.statusCode === 401 || resp.statusCode === 403 ||
+            (data && (data.code === 40003 || data.code === 40001));
+          if (authFail) {
+            const err = new Error('platform auth failed (' + resp.statusCode + ') code=' + (data && data.code));
+            err.authFailed = true;
+            err.raw = data;
+            return reject(err);
+          }
+          resolve(data);
+        } catch (e) { reject(new Error('bad json from platform')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy());
+    req.end();
+  });
+}
+
+function localDateStr(ms = Date.now()) {
+  const d = new Date(ms);
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+function sumUsageType(dayData, type) {
+  let s = 0;
+  for (const m of (dayData || [])) {
+    for (const u of (m.usage || [])) {
+      if (u.type === type) s += parseFloat(u.amount) || 0;
+    }
+  }
+  return s;
+}
+
+function findDayData(days, dateStr) {
+  const hit = (days || []).find((x) => x.date === dateStr);
+  return hit ? hit.data : null;
+}
+
+let platformUsageCache = { at: 0, data: null, error: null };
+let platformUsageBusy = false;
+
+function buildUsage(amount, cost) {
+  const cBizRaw = cost && cost.data && cost.data.biz_data;
+  const cBiz = Array.isArray(cBizRaw) ? (cBizRaw[0] || {}) : (cBizRaw || {});
+  const today = localDateStr();
+  const aData = findDayData(amount && amount.data && amount.data.biz_data ? amount.data.biz_data.days : null, today);
+  const cData = findDayData(cBiz.days, today);
+  const hitCost = sumUsageType(cData, 'PROMPT_CACHE_HIT_TOKEN');
+  const missCost = sumUsageType(cData, 'PROMPT_CACHE_MISS_TOKEN');
+  const outCost = sumUsageType(cData, 'RESPONSE_TOKEN');
+  return {
+    source: 'platform', date: today,
+    inputHit: sumUsageType(aData, 'PROMPT_CACHE_HIT_TOKEN'),
+    inputHitCost: hitCost,
+    inputMiss: sumUsageType(aData, 'PROMPT_CACHE_MISS_TOKEN'),
+    inputMissCost: missCost,
+    output: sumUsageType(aData, 'RESPONSE_TOKEN'),
+    outputCost: outCost,
+    requests: sumUsageType(aData, 'REQUEST'),
+    cost: hitCost + missCost + outCost,
+    costCurrency: cBiz.currency || 'CNY',
+  };
+}
+
+async function refreshPlatformUsage() {
+  if (platformUsageBusy) return;
+  platformUsageBusy = true;
+  const now = new Date();
+  const q = `?month=${now.getMonth() + 1}&year=${now.getFullYear()}`;
+  try {
+    const [amount, cost] = await Promise.all([
+      platformGet('/api/v0/usage/amount' + q),
+      platformGet('/api/v0/usage/cost' + q),
+    ]);
+    platformUsageCache = { at: Date.now(), data: buildUsage(amount, cost), error: null };
+  } catch (e) {
+    // token 失效（401/403）→ 自动刷新后重试一次（2026-08-25 用户要求：不手动 F12）
+    if (e && e.authFailed) {
+      console.log('[term] platform token invalid -> auto refresh & retry');
+      const ok = await autoRefreshPlatformToken();
+      if (ok) {
+        try {
+          const now2 = new Date();
+          const q2 = `?month=${now2.getMonth() + 1}&year=${now2.getFullYear()}`;
+          const [amount2, cost2] = await Promise.all([
+            platformGet('/api/v0/usage/amount' + q2),
+            platformGet('/api/v0/usage/cost' + q2),
+          ]);
+          platformUsageCache = { at: Date.now(), data: buildUsage(amount2, cost2), error: null };
+        } catch (e2) {
+          platformUsageCache = { at: Date.now(), data: null, error: String(e2 && e2.message || e2) };
+        }
+      } else {
+        platformUsageCache = { at: Date.now(), data: null, error: 'token refresh failed' };
+      }
+    } else {
+      platformUsageCache = { at: Date.now(), data: null, error: String(e && e.message || e) };
+    }
+  } finally {
+    platformUsageBusy = false;
+  }
+}
+refreshPlatformUsage();
+setInterval(refreshPlatformUsage, 60000);
+app.get('/api/platform-usage', (req, res) => {
+  if (platformUsageCache.data && Date.now() - platformUsageCache.at < 60000) {
+    return res.json(platformUsageCache.data);
+  }
+  if (!platformUsageBusy) refreshPlatformUsage();
+  if (platformUsageCache.data) return res.json(platformUsageCache.data);  // 旧值先给
+  res.status(503).json({ error: platformUsageCache.error || 'aggregating', fallback: true });
+});
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+// 终端会话：ws 连接建立时 spawn bash，断开时销毁
+wss.on('connection', (ws) => {
+  const term = pty.spawn(process.env.SHELL || 'bash', [], {
+    name: 'xterm-256color',
+    cols: 80,
+    rows: 24,
+    cwd: os.homedir(),
+    env: Object.assign({}, process.env, { TERM: 'xterm-256color' }),
+  });
+  console.log(`[term] connected, pid=${term.pid}`);
+
+  term.onData((data) => {
+    if (ws.readyState === ws.OPEN) ws.send(data);
+  });
+  term.onExit(({ exitCode }) => {
+    console.log(`[term] exit pid=${term.pid} code=${exitCode}`);
+    ws.close();
+  });
+
+  ws.on('message', (msg) => {
+    const data = String(msg);
+    // resize 指令（NUL 前缀避免与终端输入冲突）：\x00resize:{cols}:{rows}
+    const rm = data.match(/^\x00resize:(\d+):(\d+)$/);
+    if (rm) {
+      term.resize(parseInt(rm[1], 10), parseInt(rm[2], 10));
+      return;
+    }
+    term.write(data);
+  });
+
+  ws.on('close', () => {
+    term.kill();
+  });
+  ws.on('error', () => {
+    term.kill();
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[dsh-terminal] listening on http://${HOST}:${PORT} (pid=${process.pid})`);
+});

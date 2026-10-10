@@ -1,0 +1,14 @@
+[Unit]
+Description=DSH Terminal Server (port 3081, DSH Pet)
+Documentation=https://github.com/chongfengdy-dev/dsh-pet-client-kde
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/@REPO@/runtime/terminal-server
+ExecStart=/usr/bin/env node %h/@REPO@/runtime/terminal-server/server.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

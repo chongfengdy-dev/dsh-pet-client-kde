@@ -3,3 +3,12 @@ build/
 dist/
 # 开发期探测实验（wayland-probe 等），不随发布
 experiments/
+
+# 运行环境：依赖与本机私有数据（安装时 npm i；backgrounds 是本机终端背景图）
+runtime/terminal-server/node_modules/
+runtime/terminal-server/backgrounds/
+
+# 运行时状态文件
+runtime/terminal-server/term-state.json
+pet-state.json
+*.log

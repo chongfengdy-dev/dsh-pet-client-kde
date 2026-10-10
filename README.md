@@ -14,32 +14,62 @@ DeepSeek Harness 的状态指示器：**托盘图标 = 四色状态灯**，左�
 
 ## 一、快速开始
 
+### 一键部署（推荐）
+
 ```bash
-# 构建
-bash scripts/build.sh
-
-# 直接运行（不改动系统）
-./build/dsh-pet-client --no-autostart
-
-# 安装到用户目录（无需 sudo）
-bash scripts/install.sh
+git clone https://github.com/chongfengdy-dev/dsh-pet-client-kde.git
+cd dsh-pet-client-kde
+bash 安装.sh                 # 等价于 bash scripts/install.sh
 ```
 
-依赖：`qt6-base` `cmake` `ninja` `gcc`（Arch/CachyOS：`sudo pacman -S --needed cmake ninja qt6-base`）
+脚本自动完成五步：**检查依赖 → 构建并安装托盘客户端 → 装 3081 终端服务依赖
+→ 写 dsh profile 配置（插件 + 状态上报挂载）→ 生成并启用 systemd user 单元**。
+
+可选参数：
 
 | 参数 | 说明 |
 |:--|:--|
-| `--no-autostart` | 本次运行不注册开机自启 |
-| `--help` / `--version` | 帮助 / 版本 |
+| `--no-build` | 已有编译好的二进制，跳过构建 |
+| `--no-services` | 只装文件，不生成/启动系统服务 |
+| `--no-client` | 只部署运行环境（3080/3081 + 插件），不装托盘 |
+| `--with-wechat` | 额外部署微信通道（可选组件）|
+| `--dry-run` | 只显示会做什么，不写入任何文件 |
 
-首次运行会自动注册开机自启（`~/.config/autostart/dsh-pet-client.desktop`）。
+### 前置条件
 
-> ⚠️ **不要从 dsh 的终端/子进程里直接启动它**（`dsh-subprocess-*.scope`）：
-> 那个 scope 一收尾，systemd 会按 cgroup 把客户端一起杀掉。
-> 正常使用走开机自启或应用菜单；手工调试可用
-> `systemd-run --user --unit=dsh-pet-client --collect ~/.local/bin/dsh-pet-client`。
+需要**先有 dsh 本体**（本仓库不含它）：
 
----
+```bash
+npm i -g @deepseek-ai/dsh
+```
+
+### 手动构建
+
+```bash
+bash scripts/build.sh                    # 构建
+./build/dsh-pet-client --no-autostart    # 直接运行，不改系统
+bash scripts/install.sh                  # 只装客户端
+```
+
+依赖：`qt6-base` `cmake` `ninja` `gcc` `node` `npm`
+（Arch/CachyOS：`sudo pacman -S --needed qt6-base cmake ninja gcc nodejs npm`）
+
+### 仓库构成
+
+| 目录 | 内容 |
+|:--|:--|
+| `src/` `assets/` | 托盘客户端（Qt6/C++）与图标、KWin 脚本 |
+| `plugins/` | dsh 侧插件：状态上报、Token HUD/终端/大纲、已归档会话、token 同步、微信（可选）|
+| `runtime/` | 运行环境：3081 终端服务、dsh-web 启动包装、纯净模式配置、systemd 单元模板 |
+| `scripts/` | 部署脚本（install / sync-plugins / pack-share / build / dsh-mode-linux）|
+
+### 改完插件源码后
+
+```bash
+bash scripts/sync-plugins.sh        # 同步进 profile（profile 内是复制品，不是链接）
+systemctl --user restart dsh-web    # 重启生效（托盘菜单里也有）
+```
+
 
 ## 二、四色状态灯
 

@@ -202,12 +202,12 @@ $ node test/smoke.mjs
 ```yaml
 - insert:
     - id: pet-state
-      name: /home/dream/deepseek-harness/qt-client/dsh-pet-state-plugin/lib/index.js
+      name: <绝对路径>/dsh-pet-state-plugin/lib/index.js
       config:
         host: 127.0.0.1
         port: 3081
         path: /api/pet-state
-        greenHoldMs: 8000
+        greenHoldMs: 0
         timeoutMs: 800
         debug: false
 ```
