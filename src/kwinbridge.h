@@ -36,6 +36,12 @@ public:
     /// 关闭对话窗口（退出客户端时使用，对应 Windows 版的 WM_CLOSE）
     void closeDshWindow();
 
+    /// 设置任务栏提醒模式（由 PetApp 在状态变化时调用，脚本按需查询）
+    void setAttentionMode(const QString &mode);
+
+    /// 让 DSH 窗口请求/清除任务栏注意（KDE demandsAttention）
+    void setAttention(bool on);
+
 signals:
     /// 由 KWin 脚本回调：对话窗口是否存在 / 是否最小化 / 是否处于前台
     void dshWindowState(bool exists, bool minimized, bool active);
@@ -45,6 +51,10 @@ signals:
 public slots:
     // ---- KWin 脚本回调入口（D-Bus）----
     void DshWindowState(bool exists, bool minimized, bool active);
+
+    /// KWin 常驻脚本每 400ms 来查一次「任务栏提醒模式」：
+    ///   "off" 不提醒 / "blink" 闪烁（等待决策）/ "steady" 常亮（回复完成）
+    QString AttentionMode() const;
 
 private:
     void writeScript(const QString &path, const QString &body);
@@ -59,4 +69,5 @@ private:
     bool m_available = false;
     bool m_dshExists = false;
     bool m_dshMinimized = true;
+    QString m_attentionMode = QStringLiteral("off");   // 供 KWin 常驻脚本查询
 };

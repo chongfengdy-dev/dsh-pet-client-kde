@@ -26,7 +26,7 @@ namespace {
 constexpr const char *kAppId = "dsh-pet-client";
 constexpr const char *kDesktopFileName = "dsh-pet";   // → Wayland app_id（KWin 脚本据此识别）
 constexpr int kLaunchCooldownMs = 2000;                // 防 2s 内重复开窗
-constexpr int kStartupEnsureDelayMs = 1200;            // 启动后确保对话界面可用
+constexpr int kStartupEnsureDelayMs = 3000;            // 启动后确保对话界面可用（要等 KWin 脚本首次上报窗口状态）
 } // namespace
 
 class PetApp : public QObject
@@ -66,6 +66,10 @@ private:
     bool m_ackEdge = false;   // 对话页面刚从后台切回前台（green 回执的边沿判据）
     bool m_stoppingServices = false;   // 主动停 dsh 服务期间：抑制"窗口没了→自动拉起"
     bool m_quitting = false;
+    bool m_attentionOn = false;   // 已向任务栏请求注意（避免重复下发）
+    QString m_attentionMode = QStringLiteral("off");   // off / blink / steady
+    bool m_attentionPhase = false;                        // 闪烁相位
+    QTimer m_attentionTimer;                              // 驱动 blink
 };
 
 PetApp::PetApp(QObject *parent)
@@ -83,6 +87,15 @@ PetApp::PetApp(QObject *parent)
 
     connect(&m_kwin, &KWinBridge::dshWindowState, this, &PetApp::onDshWindowState);
     connect(&m_kwin, &KWinBridge::dshWindowMissing, this, &PetApp::launchDsh);
+
+    // 任务栏闪烁（blink）由客户端定时驱动，400ms 一次相位反转
+    m_attentionTimer.setInterval(400);
+    connect(&m_attentionTimer, &QTimer::timeout, this, [this] {
+        if (m_attentionMode != QStringLiteral("blink"))
+            return;
+        m_attentionPhase = !m_attentionPhase;
+        m_kwin.setAttention(m_attentionPhase);
+    });
 }
 
 void PetApp::run(bool enableAutostart)
@@ -97,15 +110,55 @@ void PetApp::run(bool enableAutostart)
     applyColor();
     m_state.start();
 
-    // 启动即确保对话界面可用：窗口没开就拉起，收起就呼出，已在前台不动
-    QTimer::singleShot(kStartupEnsureDelayMs, this, [this] { m_kwin.activateDshWindow(); });
+    // 启动即确保对话界面可用：窗口没开就拉起，收起就呼出，已在前台不动。
+    // ⚠️ 不能无条件调 activateDshWindow()：桥内若还没收到 KWin 脚本的首次状态上报，
+    //    它会误判「窗口不存在」→ emit dshWindowMissing() → 多开一个 PWA
+    //    （2026-10-10 主实测遇到）。改为先看客户端侧的真实状态再决定。
+    QTimer::singleShot(kStartupEnsureDelayMs, this, [this] {
+        if (m_dshExists) {
+            m_kwin.activateDshWindow();   // 已有窗口 → 只呼出，不新建
+        } else {
+            launchDsh();                  // 确实没有 → 才拉起
+        }
+    });
 }
 
 void PetApp::applyColor()
 {
     const bool visible = m_dshExists && !m_dshMinimized;
     m_tray.setBaseColor(visible ? PetColor::Blue : PetColor::Black);
-    m_tray.setRemoteColor(m_state.color());
+
+    const PetColor remote = m_state.color();
+    m_tray.setRemoteColor(remote);
+
+    // 2026-10-10 主需求：任务栏也给一路提醒（任务栏条目比托盘大，更醒目）。
+    //   orange + 窗口不在前台 → blink（400ms 闪烁：等你决策）
+    //   green  + 窗口不在前台 → steady（常亮一次：回复完成，等你来看）
+    //   其它                  → off
+    // ⚠️ 闪烁必须由客户端定时驱动：KWin 脚本引擎没有 setInterval/timer，
+    //    在脚本里做定时器是无效的（2026-10-10 实测：任务栏因此完全不亮）。
+    //    这里仍只在「模式变化」时动作，避免 demandsAttention 引发的 active 抖动。
+    QString mode = QStringLiteral("off");
+    if (!m_dshActive) {
+        if (remote == PetColor::Orange)      mode = QStringLiteral("blink");
+        // 2026-10-10 主定（方案 C）：绿色不再点亮任务栏（KDE 只有橙色高亮，改不了颜色），
+        // 改为由页面标题带 🟢 圆点提示 —— 见 plugins/dsh-term-panels/lib/client.js。
+        // "steady" 分支保留备用。
+    }
+
+    if (mode != m_attentionMode) {
+        m_attentionMode = mode;
+        m_attentionPhase = false;
+        m_attentionTimer.stop();
+        if (mode == QStringLiteral("blink")) {
+            m_kwin.setAttention(true);        // 立即亮起，随后由定时器交替
+            m_attentionTimer.start();
+        } else if (mode == QStringLiteral("steady")) {
+            m_kwin.setAttention(true);        // 常亮
+        } else {
+            m_kwin.setAttention(false);       // 清除
+        }
+    }
 }
 
 void PetApp::maybeAck()

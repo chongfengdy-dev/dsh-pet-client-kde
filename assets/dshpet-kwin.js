@@ -56,3 +56,5 @@ hook("windowActivated", function () { report(); });
 hook("windowMinimizedChanged", function () { report(); });
 
 report();
+// 注：任务栏提醒（blink/steady）由客户端定时下发命令实现。
+//     KWin 脚本引擎没有 setInterval/定时器 API，在这里做轮询是无效的（2026-10-10 实测）。

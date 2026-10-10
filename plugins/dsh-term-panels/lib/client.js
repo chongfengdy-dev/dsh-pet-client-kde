@@ -32,12 +32,79 @@ window.__ModuleLoader__.load({
 			if (document.visibilityState === "visible") notifyPetAck();
 		});
 		window.addEventListener("focus", notifyPetAck);
+		// ── 任务栏联动（2026-10-10 主需求）：让 dsh 页面 favicon 跟着 pet 状态变色 ──
+		// KDE 任务栏图标取自窗口 favicon，故改 favicon 即可让任务栏同步变色。
+		// 状态源 3081 /api/pet-state：blue / black / orange / green
+					const PET_STATE_URL = "http://127.0.0.1:3081/api/pet-state";
+			const BADGE_COLORS = { blue: "#3b82f6", black: "#4b5563", orange: "#f59e0b", green: "#22c55e" };
+			const BADGE_CANVAS = 32;
+			(function initTaskbarBadge() {
+				// dsh 页面本身没有 favicon（/favicon.ico 404），所以这里自绘一个状态圆点，
+				// 不依赖任何原图标；橙（等待决策）时在实心/半透明之间交替。
+				let badgeColor = null, blinkOn = true, blinkTimer = null, curPet = null, lastKey = null;
+				function iconLink() {
+					let l = document.querySelector('link[rel~="icon"], link[rel="shortcut icon"]');
+					if (!l) { l = document.createElement("link"); l.rel = "icon"; document.head.appendChild(l); }
+					return l;
+				}
+				function render(force) {
+					if (!badgeColor) return;                       // 无状态 → 不动 favicon
+					const key = badgeColor + "|" + (blinkOn ? 1 : 0);
+					if (!force && key === lastKey) return;         // 状态未变 → 不重画（否则会持续闪烁）
+					lastKey = key;
+					try {
+						const c = document.createElement("canvas");
+						c.width = c.height = BADGE_CANVAS;
+						const ctx = c.getContext("2d");
+						const cx = BADGE_CANVAS / 2, r = cx - 2;
+						ctx.globalAlpha = blinkOn ? 1 : 0.22;         // 灭相位 → 变淡
+						ctx.beginPath();
+						ctx.arc(cx, cx, r, 0, Math.PI * 2);
+						ctx.fillStyle = badgeColor;
+						ctx.fill();
+						ctx.lineWidth = 2;
+						ctx.strokeStyle = "rgba(0,0,0,.5)";
+						ctx.stroke();
+						iconLink().href = c.toDataURL("image/png");
+					} catch (e) { /* 静默降级 */ }
+				}
+				function setBadge(pet) {
+					if (pet === curPet) return;                    // 状态未变 → 什么都不做
+					curPet = pet;
+					// 标题前缀（任务栏条目文字）：橙=等你决策，绿=回复完成
+					dshPetTitlePrefix = pet === "orange" ? "🟠 " : (pet === "green" ? "🟢 " : "");
+					try { applyPetTitle(); } catch (e) {}
+					badgeColor = BADGE_COLORS[pet] || null;
+					const wantBlink = pet === "orange";
+					if (blinkTimer) { clearInterval(blinkTimer); blinkTimer = null; }
+					blinkOn = true;
+					if (wantBlink) {
+						blinkTimer = setInterval(() => { blinkOn = !blinkOn; render(); }, 400);
+					}
+					render(true);
+				}
+				async function poll() {
+					try {
+						const r = await fetch(PET_STATE_URL, { mode: "cors", cache: "no-store" });
+						const st = await r.json();
+						setBadge(st && st.pet);
+					} catch (e) {}
+				}
+				poll(); setInterval(poll, 1000);
+			})();
 		// v2.2 PWA 窗口锚点：dsh 页面 title 随会话标题变化，Nim 壳无法靠固定标题
 		// 找到 PWA/标签窗口做"呼出/最小化"切换 → 这里把页面标题固定为
 		// "DeepSeek Harness"（旧 WebView 版同款做法），浏览器/PWA 窗口标题稳定可寻。
-		setInterval(() => {
-			if (document.title !== "DeepSeek Harness") document.title = "DeepSeek Harness";
-		}, 1500);
+		// 2026-10-10 主需求：标题前面按状态带一个彩色圆点，任务栏条目一眼可见。
+		// 🟠 = 等你决策 / 🟢 = 回复完成 / 无前缀 = 空闲。
+		// 安全：识别 DSH 窗口的规则是「标题含 harness」，加前缀不影响（KWin 脚本与客户端同规则）。
+		let dshPetTitlePrefix = "";
+		function applyPetTitle() {
+			const want = dshPetTitlePrefix + "DeepSeek Harness";
+			if (document.title !== want) document.title = want;
+		}
+		setInterval(applyPetTitle, 1500);
+		applyPetTitle();
 		// v2.2 PWA 安装引导（用户需求）：浏览器强制 PWA 安装须用户一次确认——
 		// 捕获 beforeinstallprompt（页面可安装）且在普通标签（非应用窗口）时，
 		// 右下角浮层提示"安装 DSH 桌面应用"，点安装走系统安装（之后点鲸鱼直接拉 PWA 窗口）。

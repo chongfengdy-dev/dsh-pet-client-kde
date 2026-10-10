@@ -85,6 +85,28 @@ for (var i = 0; i < l.length; i++) {
 if (target) { target.close(); print("dsh-pet: cmd close"); }
 )JS";
 
+// 请求/清除「任务栏注意」（KDE demandsAttention：任务栏条目高亮闪动）。
+// 2026-10-10 主需求：等决策时除托盘闪外，任务栏也给一路提醒（任务栏更大更醒目）。
+const char *kCmdAttentionBody = R"JS(
+function isDsh(w) {
+    var rc = String(w.resourceClass || "");
+    if (rc.indexOf("dsh-pet") >= 0) return false;
+    if (!/harness/i.test(String(w.caption || ""))) return false;
+    return /^(chrome|chromium|microsoft-edge|brave|vivaldi|opera|firefox)/i.test(rc);
+}
+function list() { return workspace.windowList ? workspace.windowList() : workspace.clientList(); }
+var ON = __ON__;
+var l = list(), n = 0;
+for (var i = 0; i < l.length; i++) {
+    if (!isDsh(l[i])) continue;
+    if (ON && l[i].active) continue;   // 正在看这个窗口 → 不打扰
+    l[i].demandsAttention = ON;
+    n++;
+}
+print("dsh-pet: cmd attention " + (ON ? "on" : "off") + " n=" + n);
+)JS";
+
+
 } // namespace
 
 KWinBridge::KWinBridge(QObject *parent)
@@ -218,9 +240,29 @@ void KWinBridge::closeDshWindow()
     runCommand(QString::fromLatin1(kCmdClose));
 }
 
+void KWinBridge::setAttention(bool on)
+{
+    if (!m_available || !m_dshExists)
+        return;
+    runCommand(QString::fromLatin1(kCmdAttentionBody)
+                   .replace(QStringLiteral("__ON__"),
+                            on ? QStringLiteral("true") : QStringLiteral("false")));
+}
+
+
 void KWinBridge::DshWindowState(bool exists, bool minimized, bool active)
 {
     m_dshExists = exists;
     m_dshMinimized = minimized;
     emit dshWindowState(exists, minimized, active);
+}
+
+void KWinBridge::setAttentionMode(const QString &mode)
+{
+    m_attentionMode = mode;
+}
+
+QString KWinBridge::AttentionMode() const
+{
+    return m_attentionMode;
 }
