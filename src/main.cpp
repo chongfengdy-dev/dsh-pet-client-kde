@@ -88,7 +88,8 @@ PetApp::PetApp(QObject *parent)
     connect(&m_kwin, &KWinBridge::dshWindowState, this, &PetApp::onDshWindowState);
     connect(&m_kwin, &KWinBridge::dshWindowMissing, this, &PetApp::launchDsh);
 
-    // 任务栏闪烁（blink）由客户端定时驱动，400ms 一次相位反转
+    // 任务栏闪烁（blink）：客户端每 400ms 反转一次 demandsAttention。
+    // 主实测这个是真会闪的（KDE 会跟随属性变化重绘）。
     m_attentionTimer.setInterval(400);
     connect(&m_attentionTimer, &QTimer::timeout, this, [this] {
         if (m_attentionMode != QStringLiteral("blink"))
@@ -138,12 +139,14 @@ void PetApp::applyColor()
     // ⚠️ 闪烁必须由客户端定时驱动：KWin 脚本引擎没有 setInterval/timer，
     //    在脚本里做定时器是无效的（2026-10-10 实测：任务栏因此完全不亮）。
     //    这里仍只在「模式变化」时动作，避免 demandsAttention 引发的 active 抖动。
+    // 2026-10-10 主实测定稿：审批（橙）与托盘同步**闪烁**，回复完成（绿）**常亮**。
+    //   orange + 窗口不在前台 → blink（客户端 QTimer 每 400ms 反转 demandsAttention）
+    //   green  + 窗口不在前台 → steady（置位一次，保持常亮）
+    //   其它                  → off
     QString mode = QStringLiteral("off");
     if (!m_dshActive) {
         if (remote == PetColor::Orange)      mode = QStringLiteral("blink");
-        // 2026-10-10 主定（方案 C）：绿色不再点亮任务栏（KDE 只有橙色高亮，改不了颜色），
-        // 改为由页面标题带 🟢 圆点提示 —— 见 plugins/dsh-term-panels/lib/client.js。
-        // "steady" 分支保留备用。
+        else if (remote == PetColor::Green)  mode = QStringLiteral("steady");
     }
 
     if (mode != m_attentionMode) {
