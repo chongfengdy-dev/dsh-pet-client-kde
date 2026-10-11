@@ -104,6 +104,10 @@ void PetApp::run(bool enableAutostart)
     if (enableAutostart) {
         if (Autostart::install(kAppId, QStringLiteral("DSH Tray")))
             qInfo("dsh-pet: 已注册开机自启");
+    } else if (Autostart::isInstalled(kAppId)) {
+        // 2026-10-11 主定：默认不再开机自启；历史上注册过的顺手清掉。
+        if (Autostart::remove(kAppId))
+            qInfo("dsh-pet: 已移除开机自启项（已改为手动启动）");
     }
 
     m_kwin.install();
@@ -338,9 +342,11 @@ int main(int argc, char *argv[])
         QStringLiteral("DeepSeek Harness 托盘状态灯（Linux/Wayland）"));
     parser.addHelpOption();
     parser.addVersionOption();
-    QCommandLineOption noAutostart(QStringLiteral("no-autostart"),
-                                   QStringLiteral("本次运行不注册开机自启"));
-    parser.addOption(noAutostart);
+    // 2026-10-11 主定：托盘不再开机自启，改为手动启动。
+    // 需要自启时显式加 --autostart（后续安装脚本也不再写 autostart 项）。
+    QCommandLineOption autostartOpt(QStringLiteral("autostart"),
+                                    QStringLiteral("注册开机自启（默认不注册，改手动启动）"));
+    parser.addOption(autostartOpt);
     parser.process(app);
 
     // 单实例：重复启动 → 通知老实例切换对话窗口后退出
@@ -354,7 +360,7 @@ int main(int argc, char *argv[])
     QObject::connect(&guard, &SingleInstance::activated, &petApp,
                      &PetApp::activateFromSecondInstance);
 
-    petApp.run(!parser.isSet(noAutostart));
+    petApp.run(parser.isSet(autostartOpt));
     return app.exec();
 }
 

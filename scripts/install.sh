@@ -246,11 +246,12 @@ else
 
   if [ "$DRY" = 0 ]; then
     systemctl --user daemon-reload
-    for u in "${UNITS[@]}"; do systemctl --user enable "$u.service" >/dev/null 2>&1 || true; done
+    # 2026-10-11 主定：不设开机自启（服务与托盘都改手动启动）。
+    # 需要自启时自行执行：systemctl --user enable dsh-web dsh-terminal
     systemctl --user restart "${UNITS[@]/%/.service}"
     ok "服务已启用并启动"
   else
-    printf '  [dry] systemctl --user daemon-reload && enable + restart %s\n' "${UNITS[*]}"
+    printf '  [dry] systemctl --user daemon-reload && restart %s\n' "${UNITS[*]}"
   fi
 fi
 
@@ -264,7 +265,7 @@ cat <<EOF
   单元目录   : $UNIT_DIR
 
   启动客户端 : $BIN/dsh-pet-client
-  （首次运行自动注册开机自启；托盘右键菜单可启停 dsh 服务）
+  （默认不注册开机自启；托盘右键菜单可启停 dsh 服务）
 
   改完插件源码后：
       bash $HERE/scripts/sync-plugins.sh

@@ -7,7 +7,7 @@ DeepSeek Harness 的状态指示器：**托盘图标 = 四色状态灯**，左�
 > 状态显示改由托盘图标独立承担；动画、泡泡、拖动、鼠标穿透等相关代码已删除。
 
 ```
-托盘状态灯（蓝/黑/橙闪/绿） · 点击呼出对话 · dsh 服务启停 · 模式切换 · 单实例 · 开机自启
+托盘状态灯（蓝/黑/橙闪/绿） · 点击呼出对话 · dsh 服务启停 · 模式切换 · 单实例 · **手动启动（不设自启）**
 ```
 
 ---
@@ -47,7 +47,8 @@ npm i -g @deepseek-ai/dsh
 
 ```bash
 bash scripts/build.sh                    # 构建
-./build/dsh-pet-client --no-autostart    # 直接运行，不改系统
+./build/dsh-pet-client                    # 直接运行（默认不注册自启）
+./build/dsh-pet-client --autostart         # 需要开机自启时才加
 bash scripts/install.sh                  # 只装客户端
 ```
 

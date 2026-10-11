@@ -6,6 +6,15 @@
 > dsh **运行环境**组件（终端服务、dsh 插件、启动包装）的改动不在这里，
 > 见 `../dsh-runtime/CHANGELOG.md`。
 
+### 2026-10-11 改为全手动启动
+
+- **不再开机自启**（服务与托盘都改为手动）：
+  - `systemctl --user disable dsh-web dsh-terminal dsh-wechat`（unit 保留，随时可手动起）
+  - 删除 `~/.config/autostart/dsh-pet-client.desktop`
+  - 客户端默认**不注册自启**；需要时显式加 `--autostart`（原 `--no-autostart` 选项取消）
+  - 启动时若发现历史自启项，会**自动清掉**
+  - `scripts/install.sh` 不再执行 `systemctl --user enable`
+
 ## v1.1（2026-10-10）
 
 本版新增/修复（详见下方各条）：
