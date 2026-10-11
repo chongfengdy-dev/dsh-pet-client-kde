@@ -9,11 +9,11 @@
 #   4. 说明文档一律 .md
 #
 # 用法：
-#   ./pack-share.sh 1.0                    # 输出到仓库 dist/
-#   ./pack-share.sh 1.0 /path/to/output    # 指定输出目录
+#   ./pack-share.sh 1.1                    # 输出到仓库 dist/
+#   ./pack-share.sh 1.1 /path/to/output    # 指定输出目录
 set -euo pipefail
 
-VERSION="${1:?用法: pack-share.sh <版本号，如 1.0> [输出目录]}"
+VERSION="${1:?用法: pack-share.sh <版本号，如 1.1> [输出目录]}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${2:-$HERE/dist}"
 NAME="DSH-Pet-Linux-v$VERSION"

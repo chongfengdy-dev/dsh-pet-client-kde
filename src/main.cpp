@@ -328,7 +328,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     QApplication::setApplicationName(QString::fromLatin1(kAppId));
     QApplication::setApplicationDisplayName(QStringLiteral("DSH Pet"));
-    QApplication::setApplicationVersion(QStringLiteral("1.0"));
+    QApplication::setApplicationVersion(QStringLiteral("1.1"));
     QApplication::setOrganizationName(QStringLiteral("dsh"));
     QApplication::setDesktopFileName(QString::fromLatin1(kDesktopFileName));
     app.setQuitOnLastWindowClosed(false);
